@@ -128,15 +128,21 @@ class SonoffSwitch(SonoffDevice):
         """
         Turn the switch on.
         """
+        if self.outlet is None:
+            self.outlet = 0
+
         self.logger.debug("Switch turn_on called.")
-        self.update_params({"switch": "on"})
+        self.update_params({"switch": "on","outlet":self.outlet})
 
     async def turn_off(self):
         """
         Turn the switch off.
         """
+        if self.outlet is None:
+            self.outlet = 0
+
         self.logger.debug("Switch turn_off called.")
-        self.update_params({"switch": "off"})
+        self.update_params({"switch": "off","outlet":self.outlet})
 
     async def shutdown_inching(self):
         self.logger.debug("shutdown_inching running")
@@ -184,3 +190,4 @@ class SonoffSwitch(SonoffDevice):
 
             if self.parent_callback_after_update is not None:
                 await self.parent_callback_after_update(self)
+
