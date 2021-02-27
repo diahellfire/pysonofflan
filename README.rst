@@ -1,5 +1,5 @@
 =============
-pysonofflanr3
+pysonofflanr3 (channel control via outlet)
 =============
 
 
@@ -71,7 +71,7 @@ Features
 
 * Discover all devices on local network
 * Read device state
-* Switch device ON/OFF
+* Switch device ON/OFF in channel mode
 * Listen for state changes announced by the device (e.g. by physical switch)
 * Activate inching/momentary device, with variable ON time (e.g. 1s)
 
@@ -95,13 +95,17 @@ Command-Line Usage
       A cli tool for controlling Sonoff Smart Switches/Plugs in LAN Mode.
 
     Options:
-      --host TEXT          IP address or hostname of the device to connect to.
-      --device_id TEXT     Device ID of the device to connect to.
-      --inching TEXT       Number of seconds of "on" time if this is an
-                           Inching/Momentary switch.
-      -l, --level LVL  Either CRITICAL, ERROR, WARNING, INFO or DEBUG
-      --help               Show this message and exit.
-      --api_key KEY        Needed for devices not in DIY mode. See https://pysonofflanr3.readthedocs.io/encryption.html
+  --host TEXT         IP address or hostname of the device to connect to.
+  --device_id TEXT    Device ID of the device to connect to.
+  --api_key TEXT      api key for the device to connect to.
+  --outlet TEXT       Number of channel
+  --inching TEXT      Number of seconds of "on" time if this is an
+                      Inching/Momentary switch.
+  --wait TEXT         time to wait for listen.
+  -l, --loglevel LVL  Either CRITICAL, ERROR, WARNING, INFO or DEBUG
+  --version           Show the version and exit.
+  --help              Show this message and exit.
+
       
     Commands:
       discover  Discover devices in the network
@@ -123,7 +127,7 @@ Usage Example
     2019-01-31 00:41:35,016 - info: == Device: 10006866e9 (192.168.0.77) ==
     2019-01-31 00:41:35,016 - info: State: OFF
 
-    $ pysonofflanr3 --host 192.168.0.77 on
+    $ pysonofflanr3 --host 192.168.0.77 on 2
     2019-01-31 00:49:40,334 - info: Initialising SonoffSwitch with host 192.168.0.77
     2019-01-31 00:49:40,508 - info:
     2019-01-31 00:49:40,508 - info: Initial state:
