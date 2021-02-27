@@ -1,418 +1,483 @@
+"""
+pysonofflan
+Python library supporting Sonoff Smart Devices (Basic/S20/Touch) in LAN Mode.
+"""
+import asyncio
 import json
 import logging
-import time
-from typing import Dict, Union, Callable, Awaitable
-import asyncio
+import sys
+from typing import Callable, Awaitable, Dict
 import traceback
-import collections
-import requests
-from zeroconf import ServiceBrowser, Zeroconf
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-from pysonofflanr3 import sonoffcrypto
+from pysonofflanr3 import SonoffLANModeClient
 from pysonofflanr3 import utils
-import socket
 
 
-class SonoffLANModeClient:
-    """
-    Implementation of the Sonoff LAN Mode Protocol R3
-
-    Uses protocol as was documented by Itead
-
-    This document has since been unpublished
-    """
-
-    """
-    Initialise class with connection parameters
-
-    :param str host: host name (is ip address)
-    :param device_id: the device name in the mDS servie name
-    :return:
-    """
-
-    DEFAULT_TIMEOUT = 5
-    DEFAULT_PING_INTERVAL = 5
-    SERVICE_TYPE = "_ewelink._tcp.local."
-
-    # only a single zeroconf instance for all instances of this class
-    zeroconf = Zeroconf()
-
+class SonoffDevice(object):
     def __init__(
         self,
         host: str,
-        event_handler: Callable[[str], Awaitable[None]],
-        ping_interval: int = DEFAULT_PING_INTERVAL,
-        timeout: int = DEFAULT_TIMEOUT,
-        logger: logging.Logger = None,
+        callback_after_update: Callable[..., Awaitable[None]] = None,
+        shared_state: Dict = None,
+        logger=None,
         loop=None,
+        ping_interval=SonoffLANModeClient.DEFAULT_PING_INTERVAL,
+        timeout=SonoffLANModeClient.DEFAULT_TIMEOUT,
+        context: str = None,
         device_id: str = "",
         api_key: str = "",
         outlet: int = None,
-    ):
+    ) -> None:
+        """
+        Create a new SonoffDevice instance.
 
+        :param str host: host name or ip address on which the device listens
+        :param context: optional child ID for context in a parent device
+        """
+        self.callback_after_update = callback_after_update
         self.host = host
-        self.device_id = device_id
+        self.context = context
         self.api_key = api_key
         self.outlet = outlet
-        self.logger = logger
-        self.event_handler = event_handler
-        self.connected_event = asyncio.Event()
-        self.disconnected_event = asyncio.Event()
-        self.service_browser = None
+        self.shared_state = shared_state
+        self.basic_info = None
+        self.params = {"switch": "unknown"}
         self.loop = loop
-        self.http_session = None
-        self.my_service_name = None
-        self.last_request = None
-        self.encrypted = False
-        self.type = None
-        self._info_cache = None
-        self._last_params = {"switch": "off"}
-        self._times_added = 0
+        self.tasks = []
+        self.new_loop = False
 
-    def listen(self):
-        """
-        Setup a mDNS listener
-        """
+        if logger is None:  # pragma: no cover
+            self.logger = logging.getLogger(__name__)
+        else:
+            self.logger = logger
 
-        # listen for any added SOnOff
-        self.service_browser = ServiceBrowser(
-            SonoffLANModeClient.zeroconf,
-            SonoffLANModeClient.SERVICE_TYPE,
-            listener=self,
+        # Ctrl-C (KeyboardInterrupt) does not work well on Windows
+        # This module solve that issue with wakeup coroutine.
+        # noqa https://stackoverflow.com/questions/24774980/why-cant-i-catch-sigint-when-asyncio-event-loop-is-running/24775107#24775107
+        # noqa code lifted from https://gist.github.com/lambdalisue/05d5654bd1ec04992ad316d50924137c
+        if sys.platform.startswith("win"):
+
+            def hotfix(
+                loop: asyncio.AbstractEventLoop,
+            ) -> asyncio.AbstractEventLoop:
+                loop.call_soon(_wakeup, loop, 1.0)
+                return loop
+
+            def _wakeup(
+                loop: asyncio.AbstractEventLoop, delay: float = 1.0
+            ) -> None:
+                loop.call_later(delay, _wakeup, loop, delay)
+
+        else:
+            # Do Nothing on non Windows
+            def hotfix(
+                loop: asyncio.AbstractEventLoop,
+            ) -> asyncio.AbstractEventLoop:
+                return loop
+
+        try:
+            if self.loop is None:
+
+                self.new_loop = True
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+
+            self.logger.debug(
+                "Initializing SonoffLANModeClient class in SonoffDevice"
+            )
+            self.client = SonoffLANModeClient(
+                host,
+                self.handle_message,
+                ping_interval=ping_interval,
+                timeout=timeout,
+                logger=self.logger,
+                loop=self.loop,
+                device_id=device_id,
+                api_key=api_key,
+                outlet=outlet,
+            )
+
+            self.message_ping_event = asyncio.Event()
+            self.message_acknowledged_event = asyncio.Event()
+            self.params_updated_event = asyncio.Event()
+
+            self.client.listen()
+
+            self.tasks.append(
+                self.loop.create_task(self.send_availability_loop())
+            )
+
+            self.send_updated_params_task = self.loop.create_task(
+                self.send_updated_params_loop()
+            )
+            self.tasks.append(self.send_updated_params_task)
+
+            if self.new_loop:
+                hotfix(self.loop)  # see Cltr-C hotfix earlier in routine
+                self.loop.run_until_complete(self.send_updated_params_task)
+
+        except asyncio.CancelledError:
+            self.logger.debug("SonoffDevice loop ended, returning")
+
+    async def send_availability_loop(self):
+
+        self.logger.debug("enter send_availability_loop()")
+
+        try:
+            while True:
+
+                self.logger.debug("waiting for connection")
+
+                await self.client.connected_event.wait()
+                self.client.disconnected_event.clear()
+
+                self.logger.info(
+                    "%s: Connected event, waiting for disconnect",
+                    self.client.device_id,
+                )
+
+                # Don't send update when we connect, handle_message() will
+                # if self.callback_after_update is not None:
+                #    await self.callback_after_update(self)
+
+                await self.client.disconnected_event.wait()
+                self.client.connected_event.clear()
+
+                # clear state so we know to send update when connection returns
+                self.params = {"switch": "unknown"}
+                self.client._info_cache = None
+
+                self.logger.info(
+                    "%s: Disconnected event, sending 'unavailable' update",
+                    self.client.device_id,
+                )
+
+                if self.callback_after_update is not None:
+                    await self.callback_after_update(self)
+
+        finally:
+            self.logger.debug("exiting send_availability_loop()")
+
+    async def send_updated_params_loop(self):
+
+        self.logger.debug(
+            "send_updated_params_loop is active on the event loop"
         )
 
-    def close_connection(self):
-
-        self.logger.debug("enter close_connection()")
-        self.service_browser = None
-        self.disconnected_event.set()
-        self.my_service_name = None
-
-    def remove_service(self, zeroconf, type, name):
-
-        if self.my_service_name == name:
-            self._info_cache = None
-            self.logger.debug("Service %s flagged for removal" % name)
-            self.loop.run_in_executor(None, self.retry_connection)
-
-    def add_service(self, zeroconf, type, name):
-
-        if self.my_service_name is not None:
-
-            if self.my_service_name == name:
-                self._times_added += 1
-                self.logger.info(
-                    "Service %s added again (%s times)"
-                    % (name, self._times_added)
-                )
-                self.my_service_name = None
-                asyncio.run_coroutine_threadsafe(
-                    self.event_handler({}), self.loop
-                )
-
-        if self.my_service_name is None:
-
-            info = zeroconf.get_service_info(type, name)
-            found_ip = utils.parseAddress(info.address)
-
-            if self.device_id is not None:
-
-                if (
-                    name
-                    == "eWeLink_"
-                    + self.device_id
-                    + "."
-                    + SonoffLANModeClient.SERVICE_TYPE
-                ):
-                    self.my_service_name = name
-
-            elif self.host is not None:
-
-                try:
-
-                    if socket.gethostbyname(self.host) == found_ip:
-                        self.my_service_name = name
-
-                except TypeError:
-
-                    if self.host == found_ip:
-                        self.my_service_name = name
-
-            if self.my_service_name is not None:
-
-                self.logger.info(
-                    "Service type %s of name %s added", type, name
-                )
-
-                self.create_http_session()
-                self.set_retries(0)
-
-                # process the initial message
-                self.update_service(zeroconf, type, name)
-
-    def update_service(self, zeroconf, type, name):
-
-        data = None
-
-        # This is needed for zeroconf 0.24.1
-        # onwards as updates come to the parent node
-        if self.my_service_name != name:
-            return
-
-        info = zeroconf.get_service_info(type, name)
-        found_ip = utils.parseAddress(info.address)
-        self.set_url(found_ip, str(info.port))
-
-        # Useful optimsation for 0.24.1 onwards (fixed in 0.24.5 though)
-        # as multiple updates that are the same are received
-        if info.properties == self._info_cache:
-            self.logger.info("same update received for device: %s", name)
-            return
-        else:
-            self._info_cache = info.properties
+        retry_count = 0
 
         try:
 
-            self.logger.debug("properties: %s", info.properties)
-
-            self.type = info.properties.get(b"type")
-            self.logger.debug("type: %s", self.type)
-
-            data1 = info.properties.get(b"data1")
-            data2 = info.properties.get(b"data2")
-
-            if data2 is not None:
-                data1 += data2
-                data3 = info.properties.get(b"data3")
-
-                if data3 is not None:
-                    data1 += data3
-                    data4 = info.properties.get(b"data4")
-
-                    if data4 is not None:
-                        data1 += data4
-
-            if info.properties.get(b"encrypt"):
-
-                if self.api_key == "" or self.api_key is None:
-                    self.logger.error(
-                        "Missing api_key for encrypted device: %s", name
-                    )
-                    data = None
-
-                else:
-                    self.encrypted = True
-                    # decrypt the message
-                    iv = info.properties.get(b"iv")
-                    data = sonoffcrypto.decrypt(data1, iv, self.api_key)
-                    self.logger.debug("decrypted data: %s", data)
-
-            else:
-                self.encrypted = False
-                data = data1
-
-            self.properties = info.properties
-
-        except ValueError as ex:
-            self.logger.error(
-                "Error updating service for device %s: %s"
-                " Probably wrong API key.",
-                self.device_id,
-                format(ex),
+            self.logger.debug(
+                "Starting loop waiting for device params to change"
             )
+
+            while True:
+                self.logger.debug(
+                    "send_updated_params_loop now awaiting event"
+                )
+
+                await self.params_updated_event.wait()
+
+                await self.client.connected_event.wait()
+                self.logger.debug("Connected!")
+
+                update_message = self.client.get_update_payload(
+                    self.device_id, self.params
+                )
+
+                try:
+                    self.message_ping_event.clear()
+                    self.message_acknowledged_event.clear()
+
+                    await self.loop.run_in_executor(
+                        None, self.client.send_switch, update_message
+                    )
+
+                    await asyncio.wait_for(
+                        self.message_ping_event.wait(),
+                        utils.calculate_retry(retry_count),
+                    )
+
+                    if self.message_acknowledged_event.is_set():
+                        self.params_updated_event.clear()
+                        self.logger.debug(
+                            "Update message sent, event cleared, looping"
+                        )
+                        retry_count = 0
+                    else:
+                        self.logger.info(
+                            "we didn't get a confirmed acknowledgement, "
+                            "state has changed in between retry!"
+                        )
+                        retry_count += 1
+
+                except asyncio.TimeoutError:
+                    self.logger.warn(
+                        "Device: %s. "
+                        "Update message not received in timeout period, retry",
+                        self.device_id,
+                    )
+                    retry_count += 1
+
+                except asyncio.CancelledError:
+                    self.logger.debug("send_updated_params_loop cancelled")
+                    break
+
+                except OSError as ex:
+                    if retry_count == 0:
+                        self.logger.warn(
+                            "Connection issue for device %s: %s",
+                            self.device_id,
+                            format(ex),
+                        )
+                    else:
+                        self.logger.debug(
+                            "Connection issue for device %s: %s",
+                            self.device_id,
+                            format(ex),
+                        )
+
+                    await asyncio.sleep(utils.calculate_retry(retry_count))
+                    retry_count += 1
+
+                except Exception as ex:  # pragma: no cover
+                    self.logger.error(
+                        "send_updated_params_loop() [inner block] "
+                        "Unexpected error for device %s: %s %s",
+                        self.device_id,
+                        format(ex),
+                        traceback.format_exc(),
+                    )
+                    await asyncio.sleep(utils.calculate_retry(retry_count))
+                    retry_count += 1
+
+        except asyncio.CancelledError:
+            self.logger.debug("send_updated_params_loop cancelled")
 
         except Exception as ex:  # pragma: no cover
             self.logger.error(
-                "Error updating service for device %s: %s, %s",
+                "send_updated_params_loop() [outer block] "
+                "Unexpected error for device %s: %s %s",
                 self.device_id,
                 format(ex),
                 traceback.format_exc(),
             )
 
         finally:
-            # process the events on an event loop
-            # this method is on a background thread called from zeroconf
-            asyncio.run_coroutine_threadsafe(
-                self.event_handler(data), self.loop
+            self.logger.debug("send_updated_params_loop finally block reached")
+
+    def update_params(self, params):
+
+        if self.params != params:
+
+            self.logger.debug(
+                "Scheduling params update message to device: %s" % params
             )
-
-    def retry_connection(self):
-
-        while True:
-            try:
-                self.logger.debug(
-                    "Sending retry message for %s" % self.device_id
-                )
-
-                # in retry connection, we automatically retry 3 times
-                self.set_retries(3)
-                self.send_signal_strength()
-                self.logger.info(
-                    "Service %s flagged for removal, but is still active!"
-                    % self.device_id
-                )
-                break
-
-            except OSError as ex:
-                self.logger.debug(
-                    "Connection issue for device %s: %s",
-                    self.device_id,
-                    format(ex),
-                )
-                self.logger.info("Service %s removed" % self.device_id)
-                self.close_connection()
-                break
-
-            except Exception as ex:  # pragma: no cover
-                self.logger.error(
-                    "Retry_connection() Unexpected error for device %s: %s %s",
-                    self.device_id,
-                    format(ex),
-                    traceback.format_exc(),
-                )
-                break
-
-            finally:
-                # set retires back to 0
-                self.set_retries(0)
-
-    def send_switch(self, request: Union[str, Dict]):
-
-        if self.type == b"strip":
-            response = self.send(request, self.url + "/zeroconf/switches")
+            self.params = params
+            self.params_updated_event.set()
         else:
-            response = self.send(request, self.url + "/zeroconf/switch")
+            self.logger.debug("unnecessary update received, ignoring")
+
+    async def handle_message(self, message):
+
+        self.logger.debug("enter handle_message() %s", message)
+
+        # Null message shuts us down if we are CLI or sends update if API
+        if message is None:
+            if self.new_loop:
+                self.shutdown_event_loop()
+            else:
+                await self.callback_after_update(self)
+            return
+
+        # Empty message sends update
+        if message == {}:
+            await self.callback_after_update(self)
+            return
+
+        """
+        Receive message sent by the device and handle it, either updating
+        state or storing basic device info
+        """
 
         try:
-            response_json = json.loads(response.content.decode("utf-8"))
+            self.message_ping_event.set()
 
-            error = response_json["error"]
+            response = json.loads(message.decode("utf-8"))
 
-            if error != 0:
-                self.logger.warning(
-                    "error received: %s, %s", self.device_id, response.content
-                )
-                # no need to process error, retry will resend message
+            if self.client.type == b"strip":
+
+                if self.outlet is None:
+                    self.outlet = 0
+
+                switch_status = response["switches"][int(self.outlet)][
+                    "switch"
+                ]
+
+            elif (
+                self.client.type == b"plug"
+                or self.client.type == b"diy_plug"
+                or self.client.type == b"enhanced_plug"
+                or self.client.type == b"th_plug"
+            ):
+
+                switch_status = response["switch"]
 
             else:
-                self.logger.debug("message sent to switch successfully")
-                # nothing to do, update is processed via the mDNS update
+                self.logger.error(
+                    "Unknown message received from device: " % message
+                )
+                raise Exception("Unknown message received from device")
 
-            return response
+            self.logger.debug(
+                "Message: Received status from device, storing in instance"
+            )
+            self.basic_info = response
+            self.basic_info["deviceid"] = self.host
+
+            self.client.connected_event.set()
+            self.logger.info(
+                "%s: Connected event, sending 'available' update",
+                self.client.device_id,
+            )
+
+            send_update = False
+
+            # is there is a new message queued to be sent
+            if self.params_updated_event.is_set():
+
+                # only send client update message if the change successful
+                if self.params["switch"] == switch_status:
+
+                    self.message_acknowledged_event.set()
+                    send_update = True
+                    self.logger.debug(
+                        "expected update received from switch: %s",
+                        switch_status,
+                    )
+
+                else:
+                    self.logger.info(
+                        "failed update! state is: %s, expecting: %s",
+                        switch_status,
+                        self.params["switch"],
+                    )
+
+            else:
+                # this is a status update message originating from the device
+                # only send client update message if the status has changed
+
+                self.logger.info(
+                    "unsolicited update received from switch: %s",
+                    switch_status,
+                )
+
+                if self.params["switch"] != switch_status:
+                    self.params = {"switch": switch_status}
+                    send_update = True
+
+            if send_update and self.callback_after_update is not None:
+                await self.callback_after_update(self)
 
         except Exception as ex:  # pragma: no cover
             self.logger.error(
-                "error %s processing response: %s, %s",
+                "Unexpected error in handle_message() for device %s: %s %s",
+                self.device_id,
                 format(ex),
-                response,
-                response.content,
+                traceback.format_exc(),
             )
 
-    def send_signal_strength(self):
+    def shutdown_event_loop(self):
+        self.logger.debug("shutdown_event_loop called")
 
-        response = self.send(
-            self.get_update_payload(self.device_id, {}),
-            self.url + "/zeroconf/signal_strength",
-        )
+        try:
+            # Hide Cancelled Error exceptions during shutdown
+            def shutdown_exception_handler(loop, context):
+                if "exception" not in context or not isinstance(
+                    context["exception"], asyncio.CancelledError
+                ):
+                    loop.default_exception_handler(context)
 
-        if response.status_code == 500:
-            self.logger.error("500 received")
-            raise OSError
+            self.loop.set_exception_handler(shutdown_exception_handler)
 
-        else:
-            return response
+            # Handle shutdown gracefully by waiting for all tasks
+            # to be cancelled
+            tasks = asyncio.gather(
+                *self.tasks, loop=self.loop, return_exceptions=True
+            )
 
-    def send(self, request: Union[str, Dict], url):
+            if self.new_loop:
+                tasks.add_done_callback(lambda t: self.loop.stop())
+
+            tasks.cancel()
+
+            # Keep the event loop running until it is either
+            # destroyed or all tasks have really terminated
+            if self.new_loop:
+                while (
+                    not tasks.done()
+                    and not self.loop.is_closed()
+                    and not self.loop.is_running()
+                ):
+                    self.loop.run_forever()
+
+        except Exception as ex:  # pragma: no cover
+            self.logger.error(
+                "Unexpected error in shutdown_event_loop(): %s", format(ex)
+            )
+
+    @property
+    def device_id(self) -> str:
         """
-        Send message to an already-connected Sonoff LAN Mode Device
-        and return the response.
-        :param request: command to send to the device (can be dict or json)
+        Get current device ID (immutable value based on hardware MAC address)
+
+        :return: Device ID.
+        :rtype: str
+        """
+        return self.client.properties[b"id"].decode("utf-8")
+
+    async def turn_off(self) -> None:
+        """
+        Turns the device off.
+        """
+        raise NotImplementedError("Device subclass needs to implement this.")
+
+    @property
+    def is_off(self) -> bool:
+        """
+        Returns whether device is off.
+
+        :return: True if device is off, False otherwise.
+        :rtype: bool
+        """
+        return not self.is_on
+
+    async def turn_on(self) -> None:
+        """
+        Turns the device on.
+        """
+        raise NotImplementedError(
+            "Device subclass needs to implement this."
+        )  # pragma: no cover
+
+    @property
+    def is_on(self) -> bool:
+        """
+        Returns whether the device is on.
+
+        :return: True if the device is on, False otherwise.
+        :rtype: bool
         :return:
         """
+        raise NotImplementedError(
+            "Device subclass needs to implement this."
+        )  # pragma: no cover
 
-        data = json.dumps(request, separators=(",", ":"))
-        self.logger.debug("Sending http message to %s: %s", url, data)
-        response = self.http_session.post(url, data=data)
-        self.logger.debug(
-            "response received: %s %s", response, response.content
-        )
+    def __repr__(self):
+        return "<%s at %s>" % (self.__class__.__name__, self.device_id)
 
-        return response
+    @property
+    def available(self) -> bool:
 
-    def get_update_payload(self, device_id: str, params: dict) -> Dict:
+        return self.client.connected_event.is_set()
 
-        self._last_params = params
-
-        if self.type == b"strip" and params != {} and params is not None:
-
-            if self.outlet is None:
-                self.outlet = 0
-
-            switches = {"switches": [{"switch": "off", "outlet": 0}]}
-            switches["switches"][0]["switch"] = params["switch"]
-            switches["switches"][0]["outlet"] = int(self.outlet)
-            params = switches
-
-        payload = {
-            "sequence": str(
-                int(time.time() * 1000)
-            ),  # otherwise buffer overflow type issue caused in the device
-            "deviceid": device_id,
-        }
-
-        if self.encrypted:
-
-            self.logger.debug("params: %s", params)
-
-            sonoffcrypto.format_encryption_msg(payload, self.api_key, params)
-            self.logger.debug("encrypted: %s", payload)
-
-        else:
-            payload["encrypt"] = False
-            payload["data"] = params
-            self.logger.debug("message to send (plaintext): %s", payload)
-
-        return payload
-
-    def set_url(self, ip, port):
-
-        socket_text = ip + ":" + port
-        self.url = "http://" + socket_text
-        self.logger.debug("service is at %s", self.url)
-
-    def create_http_session(self):
-
-        # create an http session so we can use http keep-alives
-        self.http_session = requests.Session()
-
-        # add the http headers
-        # note the commented out ones are copies from the sniffed ones
-        headers = collections.OrderedDict(
-            {
-                "Content-Type": "application/json;charset=UTF-8",
-                # "Connection": "keep-alive",
-                "Accept": "application/json",
-                "Accept-Language": "en-gb",
-                # "Content-Length": "0",
-                # "Accept-Encoding": "gzip, deflate",
-                # "Cache-Control": "no-store",
-            }
-        )
-
-        # needed to keep headers in same order
-        # instead of self.http_session.headers.update(headers)
-        self.http_session.headers = headers
-
-    def set_retries(self, retry_count):
-
-        # no retries at moment, control in sonoffdevice
-        retries = Retry(
-            total=retry_count,
-            backoff_factor=0.5,
-            method_whitelist=["POST"],
-            status_forcelist=None,
-        )
-
-        self.http_session.mount("http://", HTTPAdapter(max_retries=retries))
